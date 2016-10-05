@@ -18,14 +18,13 @@ use version::HttpVersion;
 
 pub use self::decode::Decoder;
 pub use self::encode::Encoder;
-pub use self::txn::Txn;
 
 pub use self::parse::parse;
 
 mod decode;
 mod encode;
-mod parse;
-pub mod txn;
+pub mod parse;
+pub mod serialize;
 
 /*
 fn should_have_response_body(method: &Method, status: u16) -> bool {

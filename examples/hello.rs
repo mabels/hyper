@@ -1,23 +1,32 @@
-#![deny(warnings)]
+//#![deny(warnings)]
 extern crate hyper;
+extern crate futures;
 extern crate pretty_env_logger;
 extern crate num_cpus;
 
 use hyper::{HttpStream};
-use hyper::header::{ContentLength, /*ContentType*/};
-use hyper::server::{Server, Handler, Transaction/*, HttpListener*/};
+use hyper::header::{ContentLength, ContentType};
+use hyper::server::{Server, Service, Request, Response/*, HttpListener*/};
 
 static PHRASE: &'static [u8] = b"Hello World!";
 
+#[derive(Clone, Copy)]
 struct Hello;
 
-impl Handler<HttpStream> for Hello {
-    fn ready(&mut self, txn: &mut Transaction<HttpStream>) {
-        txn.response().headers_mut()
-            .set(ContentLength(PHRASE.len() as u64));
-            //.set(ContentType::plaintext());
-        let n = txn.write(PHRASE).unwrap();
-        debug_assert_eq!(n, PHRASE.len());
+impl Service for Hello {
+    type Request = Request;
+    type Response = Response;
+    type Error = hyper::Error;
+    type Future = ::futures::Finished<Response, hyper::Error>;
+    fn call(&self, _req: Request) -> Self::Future {
+        ::futures::finished(Response::new()
+            .header(ContentLength(PHRASE.len() as u64))
+            .header(ContentType::plaintext())
+            .body(PHRASE))
+    }
+
+    fn poll_ready(&self) -> ::futures::Async<()> {
+        ::futures::Async::Ready(())
     }
 }
 
@@ -27,7 +36,8 @@ fn main() {
 
     println!("Listening on http://127.0.0.1:3000");
     Server::http(&"127.0.0.1:3000".parse().unwrap()).unwrap()
-        .handle(|inc: hyper::Result<_>| inc.map(|_| Hello)).unwrap();
+        .handle(Hello).unwrap();
+        //.handle_closure(|_req| Response::new()).unwrap();
 
     /*
     let listener = HttpListener::bind(&"127.0.0.1:3000".parse().unwrap()).unwrap();

@@ -6,7 +6,8 @@ use std::marker::PhantomData;
 use std::mem;
 use std::time::Duration;
 
-use futures::Poll;
+use futures::{Poll, Async};
+use tokio::io::FramedIo;
 
 use http::{self, h1, Http1Transaction, Io, WriteBuf};
 //use http::channel;
@@ -31,401 +32,6 @@ pub struct Conn<K: Key, T: Transport, H: ConnectionHandler<T>> {
 }
 
 impl<K: Key, T: Transport, H: ConnectionHandler<T>> Conn<K, T, H> {
-    fn parse(&mut self) -> ::Result<Option<http::MessageHead<<<<H as ConnectionHandler<T>>::Txn as TransactionHandler<T>>::Transaction as Http1Transaction>::Incoming>>> {
-        self.io.parse::<<<H as ConnectionHandler<T>>::Txn as TransactionHandler<T>>::Transaction>()
-    }
-
-    /*
-    fn read(&mut self, state: State<H::Txn, T>) -> State<H::Txn, T> {
-         match state {
-            State::Init { interest: Next_::Read, .. } => {
-                let head = match self.parse() {
-                    Ok(head) => head,
-                    Err(::Error::Io(e)) => match e.kind() {
-                        io::ErrorKind::WouldBlock |
-                        io::ErrorKind::Interrupted => return state,
-                        _ => {
-                            debug!("io error trying to parse {:?}", e);
-                            return State::Closed;
-                        }
-                    },
-                    Err(e) => {
-                        //TODO: send proper error codes depending on error
-                        trace!("parse eror: {:?}", e);
-                        return State::Closed;
-                    }
-                };
-                let mut handler = match self.handler.transaction() {
-                    Some(handler) => handler,
-                    None => unreachable!()
-                };
-                match <<H as ConnectionHandler<T>>::Txn as TransactionHandler<T>>::Transaction::decoder(&head) {
-                    Ok(decoder) => {
-                        trace!("decoder = {:?}", decoder);
-                        let keep_alive = self.keep_alive_enabled && head.should_keep_alive();
-                        let next = handler.on_incoming(head, &self.transport);
-                        trace!("handler.on_incoming() -> {:?}", next);
-
-                        match next.interest {
-                            Next_::Read => self.read(State::Http1(Http1 {
-                                handler: handler,
-                                reading: Reading::Body(decoder),
-                                writing: Writing::Init,
-                                keep_alive: keep_alive,
-                                timeout: next.timeout,
-                                _marker: PhantomData,
-                            })),
-                            Next_::Write => State::Http1(Http1 {
-                                handler: handler,
-                                reading: if decoder.is_eof() {
-                                    if keep_alive {
-                                        Reading::KeepAlive
-                                    } else {
-                                        Reading::Closed
-                                    }
-                                } else {
-                                    Reading::Wait(decoder)
-                                },
-                                writing: Writing::Head,
-                                keep_alive: keep_alive,
-                                timeout: next.timeout,
-                                _marker: PhantomData,
-                            }),
-                            Next_::ReadWrite => self.read(State::Http1(Http1 {
-                                handler: handler,
-                                reading: Reading::Body(decoder),
-                                writing: Writing::Head,
-                                keep_alive: keep_alive,
-                                timeout: next.timeout,
-                                _marker: PhantomData,
-                            })),
-                            Next_::Wait => State::Http1(Http1 {
-                                handler: handler,
-                                reading: Reading::Wait(decoder),
-                                writing: Writing::Init,
-                                keep_alive: keep_alive,
-                                timeout: next.timeout,
-                                _marker: PhantomData,
-                            }),
-                            Next_::End |
-                            Next_::Remove => State::Closed,
-                        }
-                    },
-                    Err(e) => {
-                        debug!("error creating decoder: {:?}", e);
-                        //TODO: update state from returned Next
-                        //this would allow a Server to respond with a proper
-                        //4xx code
-                        let _ = handler.on_error(e);
-                        State::Closed
-                    }
-                }
-            },
-            State::Init { .. } => {
-                trace!("on_readable State::{:?}", state);
-                state
-            },
-            State::Http1(mut http1) => {
-                let next = match http1.reading {
-                    Reading::Init => None,
-                    Reading::Parse => match self.parse() {
-                        Ok(head) => match <<H as ConnectionHandler<T>>::Txn as TransactionHandler<T>>::Transaction::decoder(&head) {
-                            Ok(decoder) => {
-                                trace!("decoder = {:?}", decoder);
-                                // if client request asked for keep alive,
-                                // then it depends entirely on if the server agreed
-                                if http1.keep_alive {
-                                    http1.keep_alive = head.should_keep_alive();
-                                }
-                                let next = http1.handler.on_incoming(head, &self.transport);
-                                http1.reading = Reading::Wait(decoder);
-                                trace!("handler.on_incoming() -> {:?}", next);
-                                Some(next)
-                            },
-                            Err(e) => {
-                                debug!("error creating decoder: {:?}", e);
-                                //TODO: respond with 400
-                                return State::Closed;
-                            }
-                        },
-                        Err(::Error::Io(e)) => match e.kind() {
-                            io::ErrorKind::WouldBlock |
-                            io::ErrorKind::Interrupted => None,
-                            _ => {
-                                debug!("io error trying to parse {:?}", e);
-                                return State::Closed;
-                            }
-                        },
-                        Err(e) => {
-                            trace!("parse error: {:?}", e);
-                            let _ = http1.handler.on_error(e);
-                            return State::Closed;
-                        }
-                    },
-                    Reading::Body(ref mut decoder) => {
-                        let wrapped = if !self.buf.is_empty() {
-                            super::Trans::Buf(self.buf.wrap(&mut self.transport))
-                        } else {
-                            super::Trans::Port(&mut self.transport)
-                        };
-
-                        Some(http1.handler.on_decode(&mut Decoder::h1(decoder, wrapped)))
-                    },
-                    _ => {
-                        trace!("Conn.on_readable State::Http1(reading = {:?})", http1.reading);
-                        None
-                    }
-                };
-                let mut s = State::Http1(http1);
-                if let Some(next) = next {
-                    s.update(next);
-                }
-                trace!("Conn.on_readable State::Http1 completed, new state = State::{:?}", s);
-
-                let again = match s {
-                    State::Http1(Http1 { reading: Reading::Body(ref encoder), .. }) => encoder.is_eof(),
-                    _ => false
-                };
-
-                if again {
-                    self.read(s)
-                } else {
-                    s
-                }
-            },
-            State::Closed => {
-                trace!("on_readable State::Closed");
-                State::Closed
-            }
-        }
-    }
-
-    fn write(&mut self, mut state: State<H::Txn, T>) -> State<H::Txn, T> {
-        let next = match state {
-            State::Init { interest: Next_::Write, .. } => {
-                // this is a Client request, which writes first, so pay
-                // attention to the version written here, which will adjust
-                // our internal state to Http1 or Http2
-                let mut handler = match self.handler.transaction() {
-                    Some(handler) => handler,
-                    None => {
-                        trace!("could not create handler {:?}", self.key);
-                        return State::Closed;
-                    }
-                };
-                let mut head = http::MessageHead::default();
-                let mut interest = handler.on_outgoing(&mut head);
-                if head.version == HttpVersion::Http11 {
-                    let mut buf = Vec::new();
-                    let keep_alive = self.keep_alive_enabled && head.should_keep_alive();
-                    let mut encoder = <<<H as ConnectionHandler<T>>::Txn as TransactionHandler<T>>::Transaction as Http1Transaction>::encode(head, &mut buf);
-                    let writing = match interest.interest {
-                        // user wants to write some data right away
-                        // try to write the headers and the first chunk
-                        // together, so they are in the same packet
-                        Next_::Write |
-                        Next_::ReadWrite => {
-                            encoder.prefix(WriteBuf {
-                                bytes: buf,
-                                pos: 0
-                            });
-                            interest = handler.on_encode(&mut Encoder::h1(&mut encoder, &mut self.transport));
-                            Writing::Ready(encoder)
-                        },
-                        _ => Writing::Chunk(Chunk {
-                            buf: Cow::Owned(buf),
-                            pos: 0,
-                            next: (encoder, interest.clone())
-                        })
-                    };
-                    state = State::Http1(Http1 {
-                        reading: Reading::Init,
-                        writing: writing,
-                        handler: handler,
-                        keep_alive: keep_alive,
-                        timeout: interest.timeout,
-                        _marker: PhantomData,
-                    })
-                }
-                Some(interest)
-            }
-            State::Init { .. } => {
-                trace!("Conn.on_writable State::{:?}", state);
-                None
-            }
-            State::Http1(Http1 { ref mut handler, ref mut writing, ref mut keep_alive, .. }) => {
-                match *writing {
-                    Writing::Init => {
-                        trace!("Conn.on_writable Http1::Writing::Init");
-                        None
-                    }
-                    Writing::Head => {
-                        let mut head = http::MessageHead::default();
-                        let mut interest = handler.on_outgoing(&mut head);
-                        // if the request wants to close, server cannot stop it
-                        if *keep_alive {
-                            // if the request wants to stay alive, then it depends
-                            // on the server to agree
-                            *keep_alive = head.should_keep_alive();
-                        }
-                        let mut buf = Vec::new();
-                        let mut encoder = <<<H as ConnectionHandler<T>>::Txn as TransactionHandler<T>>::Transaction as Http1Transaction>::encode(head, &mut buf);
-                        *writing = match interest.interest {
-                            // user wants to write some data right away
-                            // try to write the headers and the first chunk
-                            // together, so they are in the same packet
-                            Next_::Write |
-                            Next_::ReadWrite => {
-                                encoder.prefix(WriteBuf {
-                                    bytes: buf,
-                                    pos: 0
-                                });
-                                interest = handler.on_encode(&mut Encoder::h1(&mut encoder, &mut self.transport));
-                                Writing::Ready(encoder)
-                            },
-                            _ => Writing::Chunk(Chunk {
-                                buf: Cow::Owned(buf),
-                                pos: 0,
-                                next: (encoder, interest.clone())
-                            })
-                        };
-                        Some(interest)
-                    },
-                    Writing::Chunk(ref mut chunk) => {
-                        trace!("Http1.Chunk on_writable");
-                        match self.transport.write(&chunk.buf.as_ref()[chunk.pos..]) {
-                            Ok(n) => {
-                                chunk.pos += n;
-                                trace!("Http1.Chunk wrote={}, done={}", n, chunk.is_written());
-                                if chunk.is_written() {
-                                    Some(chunk.next.1.clone())
-                                } else {
-                                    None
-                                }
-                            },
-                            Err(e) => match e.kind() {
-                                io::ErrorKind::WouldBlock |
-                                io::ErrorKind::Interrupted => None,
-                                _ => {
-                                    Some(handler.on_error(e.into()))
-                                }
-                            }
-                        }
-                    },
-                    Writing::Ready(ref mut encoder) => {
-                        trace!("Http1.Ready on_writable");
-                        Some(handler.on_encode(&mut Encoder::h1(encoder, &mut self.transport)))
-                    },
-                    Writing::Wait(..) => {
-                        trace!("Conn.on_writable Http1::Writing::Wait");
-                        None
-                    }
-                    Writing::KeepAlive => {
-                        trace!("Conn.on_writable Http1::Writing::KeepAlive");
-                        None
-                    }
-                    Writing::Closed => {
-                        trace!("on_writable Http1::Writing::Closed");
-                        None
-                    }
-                }
-            },
-            State::Closed => {
-                trace!("on_writable State::Closed");
-                None
-            }
-        };
-
-        if let Some(next) = next {
-            state.update(next);
-        }
-        state
-    }
-    */
-
-    /*
-    fn can_read_more(&self, was_init: bool) -> bool {
-        match self.state {
-            State::Init { .. } => !was_init && !self.buf.is_empty(),
-            _ => !self.buf.is_empty()
-        }
-    }
-    */
-
-    fn tick(&mut self) -> Poll<(), ::error::Void> {
-        loop {
-            let next_state;
-            match self.state {
-                State::Init { .. } => {
-                    trace!("State::Init tick");
-                    let (version, head) = match self.parse() {
-                        Ok(Some(head)) => (head.version, Ok(head)),
-                        Ok(None) => return Poll::NotReady,
-                        Err(e) => {
-                            self.io.buf.consume_leading_lines();
-                            if !self.io.buf.is_empty() {
-                                trace!("parse error ({}) with bytes: {:?}", e, self.io.buf.bytes());
-                                (HttpVersion::Http10, Err(e))
-                            } else {
-                                trace!("parse error with 0 input, err = {:?}", e);
-                                self.state = State::Closed;
-                                return Poll::Ok(());
-                            }
-                        }
-                    };
-
-                    match version {
-                        HttpVersion::Http10 | HttpVersion::Http11 => {
-                            let handler = match self.handler.transaction() {
-                                Some(h) => h,
-                                None => {
-                                    trace!("could not create txn handler, key={:?}", self.key);
-                                    self.state = State::Closed;
-                                    return Poll::Ok(());
-                                }
-                            };
-                            let res = head.and_then(|head| {
-                                let decoder = <<H as ConnectionHandler<T>>::Txn as TransactionHandler<T>>::Transaction::decoder(&head);
-                                decoder.map(move |decoder| (head, decoder))
-                            });
-                            next_state = State::Http1(h1::Txn::incoming(res, handler));
-                        },
-                        _ => {
-                            warn!("unimplemented HTTP Version = {:?}", version);
-                            self.state = State::Closed;
-                            return Poll::Ok(());
-                        }
-                    }
-
-                },
-                State::Http1(ref mut http1) => {
-                    trace!("State::Http1 tick");
-                    match http1.tick(&mut self.io) {
-                        Poll::NotReady => return Poll::NotReady,
-                        Poll::Ok(TxnResult::KeepAlive) => {
-                            trace!("Http1 Txn tick complete, keep-alive");
-                            //TODO: check if keep-alive is enabled
-                            next_state = State::Init {};
-                        },
-                        Poll::Ok(TxnResult::Close) => {
-                            trace!("Http1 Txn tick complete, close");
-                            next_state = State::Closed;
-                        },
-                        Poll::Err(void) => match void {}
-                    }
-                },
-                //State::Http2
-                State::Closed => {
-                    trace!("State::Closed tick");
-                    return Poll::Ok(());
-                }
-            }
-
-            self.state = next_state;
-        }
-    }
-
-
     pub fn new(key: K, transport: T, handler: H) -> Conn<K, T, H> {
         Conn {
             handler: handler,
@@ -440,6 +46,82 @@ impl<K: Key, T: Transport, H: ConnectionHandler<T>> Conn<K, T, H> {
         }
     }
 
+    fn parse(&mut self) -> ::Result<Option<http::MessageHead<<<<H as ConnectionHandler<T>>::Txn as TransactionHandler<T>>::Transaction as Http1Transaction>::Incoming>>> {
+        self.io.parse::<<<H as ConnectionHandler<T>>::Txn as TransactionHandler<T>>::Transaction>()
+    }
+
+    fn tick(&mut self) -> Poll<(), ::error::Void> {
+        loop {
+            let next_state;
+            match self.state {
+                State::Init { .. } => {
+                    trace!("State::Init tick");
+                    let (version, head) = match self.parse() {
+                        Ok(Some(head)) => (head.version, Ok(head)),
+                        Ok(None) => return Ok(Async::NotReady),
+                        Err(e) => {
+                            self.io.buf.consume_leading_lines();
+                            if !self.io.buf.is_empty() {
+                                trace!("parse error ({}) with bytes: {:?}", e, self.io.buf.bytes());
+                                (HttpVersion::Http10, Err(e))
+                            } else {
+                                trace!("parse error with 0 input, err = {:?}", e);
+                                self.state = State::Closed;
+                                return Ok(Async::Ready(()));
+                            }
+                        }
+                    };
+
+                    match version {
+                        HttpVersion::Http10 | HttpVersion::Http11 => {
+                            let handler = match self.handler.transaction() {
+                                Some(h) => h,
+                                None => {
+                                    trace!("could not create txn handler, key={:?}", self.key);
+                                    self.state = State::Closed;
+                                    return Ok(Async::Ready(()));
+                                }
+                            };
+                            let res = head.and_then(|head| {
+                                let decoder = <<H as ConnectionHandler<T>>::Txn as TransactionHandler<T>>::Transaction::decoder(&head);
+                                decoder.map(move |decoder| (head, decoder))
+                            });
+                            next_state = State::Http1(h1::Txn::incoming(res, handler));
+                        },
+                        _ => {
+                            warn!("unimplemented HTTP Version = {:?}", version);
+                            self.state = State::Closed;
+                            return Ok(Async::Ready(()));
+                        }
+                    }
+
+                },
+                State::Http1(ref mut http1) => {
+                    trace!("State::Http1 tick");
+                    match http1.tick(&mut self.io) {
+                        Ok(Async::NotReady) => return Ok(Async::NotReady),
+                        Ok(Async::Ready(TxnResult::KeepAlive)) => {
+                            trace!("Http1 Txn tick complete, keep-alive");
+                            //TODO: check if keep-alive is enabled
+                            next_state = State::Init {};
+                        },
+                        Ok(Async::Ready(TxnResult::Close)) => {
+                            trace!("Http1 Txn tick complete, close");
+                            next_state = State::Closed;
+                        },
+                        Err(void) => match void {}
+                    }
+                },
+                //State::Http2
+                State::Closed => {
+                    trace!("State::Closed tick");
+                    return Ok(Async::Ready(()));
+                }
+            }
+
+            self.state = next_state;
+        }
+    }
     // TODO: leave this in the ConnectionHandler
     pub fn keep_alive(mut self, val: bool) -> Conn<K, T, H> {
         self.keep_alive_enabled = val;
@@ -492,6 +174,7 @@ impl<K: Key, T: Transport, H: ConnectionHandler<T>> Conn<K, T, H> {
     }
     */
 }
+
 
 impl<K: Key, T: Transport, H: ConnectionHandler<T>> fmt::Debug for Conn<K, T, H> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

@@ -11,10 +11,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use rotor::{self, Scope, EventSet, PollOpt};
+use tokio::{Loop, Sender};
 
 use header::Host;
-use http::{self, Next, RequestHead};
+use http::{self, Conn, RequestHead};
 use net::Transport;
 use uri::RequestUri;
 use {Url};
@@ -22,15 +22,17 @@ use {Url};
 pub use self::connect::{Connect, DefaultConnector, HttpConnector, HttpsConnector, DefaultTransport};
 pub use self::request::Request;
 pub use self::response::Response;
+pub use self::txn::Transaction;
 
 mod connect;
 mod dns;
 mod request;
 mod response;
+mod txn;
 
 /// A Client to make outgoing HTTP requests.
 pub struct Client<H> {
-    tx: http::channel::Sender<Notify<H>>,
+    tx: Sender<Notify<H>>,
 }
 
 impl<H> Clone for Client<H> {
@@ -79,14 +81,36 @@ impl<H: Send> Client<H> {
     where H: Handler<T>,
           T: Transport,
           C: Connect<Output=T> + Send + 'static {
-        let mut rotor_config = rotor::Config::new();
-        rotor_config.slab_capacity(config.max_sockets);
-        rotor_config.mio().notify_capacity(config.max_sockets);
+        let mut reactor = try!(Loop::new());
         let keep_alive = config.keep_alive;
         let connect_timeout = config.connect_timeout;
-        let mut loop_ = try!(rotor::Loop::new(&rotor_config));
-        let mut notifier = None;
         let mut connector = config.connector;
+
+        let handle = reactor.handle();
+        let (tx, rx) = try!(::tokio::channel::channel(&handle));
+
+        let _thread_handle = try!(thread::Builder::new().name("hyper-client".to_owned()).spawn(move || {
+            let ctx = Context {
+                connect_timeout: connect_timeout,
+                keep_alive: keep_alive,
+                //idle_conns: HashMap::new(),
+                //queue: HashMap::new(),
+            };
+            let handle = reactor.handle();
+            let work = rx.and_then(move |rx| {
+                rx.map_err(|_| ()).for_each(move |msg| {
+                    match msg {
+                        Notify::Connect(url, h) => {
+                            handle.spawn(connector.connect(url).and_then(|socket| {
+                                Conn::new(url, socket, h)
+                            }).map_err(|_| ()));
+                            Ok(())
+                        },
+                        Notify::Shutdown => Err(())
+                    }
+                })
+            });
+            /*
         {
             let not = &mut notifier;
             loop_.add_machine_with(move |scope| {
@@ -99,20 +123,13 @@ impl<H: Send> Client<H> {
                 rotor::Response::ok(ClientFsm::Connector(connector, rx))
             }).unwrap();
         }
+        */
 
-        let notifier = notifier.expect("loop.add_machine_with failed");
-        let _handle = try!(thread::Builder::new().name("hyper-client".to_owned()).spawn(move || {
-            loop_.run(Context {
-                connect_timeout: connect_timeout,
-                keep_alive: keep_alive,
-                idle_conns: HashMap::new(),
-                queue: HashMap::new(),
-            }).unwrap()
         }));
 
         Ok(Client {
             //handle: Some(handle),
-            tx: notifier,
+            tx: tx,
         })
     }
 
@@ -247,6 +264,13 @@ impl<H> fmt::Display for ClientError<H> {
     }
 }
 
+/// dox
+pub trait Handler<T: Transport>: Send + 'static {
+    /// dox
+    fn ready(&mut self, txn: &mut Transaction<T>);
+}
+
+/*
 /// A trait to react to client events that happen for each message.
 ///
 /// Each event handler returns it's desired `Next` action.
@@ -279,6 +303,8 @@ pub trait Handler<T: Transport>: Send + 'static {
         debug!("default Handler.on_control()");
     }
 }
+*/
+/*
 
 struct Message<H: Handler<T>, T: Transport> {
     handler: H,
@@ -327,14 +353,16 @@ impl<H: Handler<T>, T: Transport> http::MessageHandler<T> for Message<H, T> {
         self.handler.on_remove(transport);
     }
 }
+*/
 
-struct Context<K, H> {
+struct Context {
     connect_timeout: Duration,
     keep_alive: bool,
-    idle_conns: HashMap<K, Vec<http::Control>>,
-    queue: HashMap<K, Vec<Queued<H>>>,
+    //idle_conns: HashMap<K, Vec<http::Control>>,
+    //queue: HashMap<K, Vec<Queued<H>>>,
 }
 
+/*
 impl<K: http::Key, H> Context<K, H> {
     fn pop_queue(&mut self, key: &K) -> Option<Queued<H>> {
         let mut should_remove = false;
@@ -396,12 +424,14 @@ impl<K: http::Key, H: Handler<T>, T: Transport> http::MessageHandlerFactory<K, T
         Next::wait()
     }
 }
+*/
 
 enum Notify<T> {
     Connect(Url, T),
     Shutdown,
 }
 
+/*
 enum ClientFsm<C, H>
 where C: Connect,
       C::Output: Transport,
@@ -668,6 +698,7 @@ struct Queued<H> {
 pub struct Registration {
     notify: (http::channel::Sender<self::dns::Answer>, http::channel::Receiver<self::dns::Answer>),
 }
+*/
 
 #[cfg(test)]
 mod tests {

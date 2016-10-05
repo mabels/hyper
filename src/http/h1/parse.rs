@@ -1,10 +1,13 @@
 use std::borrow::Cow;
 use std::fmt::{self, Write};
 
+use bytes::buf::BlockBuf;
 use httparse;
+use tokio_proto::Parse;
+use tokio_proto::pipeline::Frame;
 
 use header::{self, Headers, ContentLength, TransferEncoding};
-use http::{MessageHead, RawStatus, Http1Transaction, ParseResult, ServerTransaction, ClientTransaction, RequestLine};
+use http::{MessageHead, RawStatus, Http1Transaction, ParseResult, ServerTransaction, ClientTransaction, RequestLine, RequestHead};
 use http::h1::{Encoder, Decoder};
 use method::Method;
 use status::StatusCode;
@@ -22,6 +25,29 @@ pub fn parse<T: Http1Transaction<Incoming=I>, I>(buf: &[u8]) -> ParseResult<I> {
 }
 
 
+pub struct Request;
+
+impl Parse for Request {
+    type Out = Frame<RequestHead, (), ::Error>;
+
+    fn parse(&mut self, buf: &mut BlockBuf) -> Option<Self::Out> {
+        if !buf.is_compact() {
+            buf.compact();
+        }
+        let (frame, len) = {
+            let slice = buf.bytes().expect("buf was just compacted");
+            match ServerTransaction::parse(slice) {
+                Ok(Some((head, len))) => {
+                    (Some(Frame::Message(head)), len)
+                },
+                Ok(None) => return None,
+                Err(e) => return Some(Frame::Error(e))
+            }
+        };
+        buf.shift(len);
+        frame
+    }
+}
 
 impl Http1Transaction for ServerTransaction {
     type Incoming = RequestLine;

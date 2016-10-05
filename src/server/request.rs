@@ -5,6 +5,10 @@
 
 use std::fmt;
 
+use bytes::buf::BlockBuf;
+use tokio_proto::Parse;
+use tokio_proto::pipeline::Frame;
+
 use version::HttpVersion;
 use method::Method;
 use header::Headers;
@@ -78,4 +82,19 @@ impl Request {
         (self.method, self.uri, self.version, self.headers)
     }
 
+}
+
+pub struct Parser;
+
+impl Parse for Parser {
+    type Out = Frame<Request, (), ::Error>;
+
+    #[inline]
+    fn parse(&mut self, buf: &mut BlockBuf) -> Option<Self::Out> {
+        match ::http::h1::parse::Request.parse(buf) {
+            Some(Frame::Message(head)) => Some(Frame::Message(new(head))),
+            None => None,
+            _ => unimplemented!("Framed::*")
+        }
+    }
 }

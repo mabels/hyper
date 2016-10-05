@@ -38,7 +38,7 @@ pub trait Accept/*: Evented*/ {
 
 /// An alias to `mio::tcp::TcpStream`.
 //#[derive(Debug)]
-pub struct HttpStream(pub ::tokio::TcpStream);
+pub struct HttpStream(pub ::tokio::net::TcpStream);
 
 impl Read for HttpStream {
     #[inline]

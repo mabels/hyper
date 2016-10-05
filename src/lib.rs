@@ -16,8 +16,10 @@
 //!
 //! If just getting started, consider looking over the **[Guide](../guide/)**.
 
+extern crate bytes;
 extern crate cookie;
 extern crate futures;
+extern crate futures_cpupool;
 extern crate httparse;
 #[macro_use] extern crate language_tags;
 #[macro_use] extern crate log;
@@ -34,6 +36,8 @@ extern crate security_framework;
 extern crate serde;
 extern crate time;
 extern crate tokio_core as tokio;
+extern crate tokio_proto;
+extern crate tokio_service;
 extern crate spmc;
 extern crate unicase;
 #[macro_use] extern crate url;

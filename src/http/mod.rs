@@ -17,20 +17,12 @@ use version::HttpVersion::{Http10, Http11};
 #[cfg(feature = "serde-serialization")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use self::conn::{Conn, TransactionHandler, ConnectionHandler, ConnectionHandlerFactory, Seed, Key};
+//pub use self::conn::{Conn, Key};
 
 mod buffer;
-mod conn;
-mod h1;
+//mod conn;
+pub mod h1;
 //mod h2;
-
-pub struct Transaction<'a, T: Transport + 'a, X: Http1Transaction + 'a> {
-    inner: TransactionImpl<'a, T, X>,
-}
-
-enum TransactionImpl<'a, T: Transport + 'a, X: Http1Transaction + 'a> {
-    H1(h1::txn::TxnIo<'a, T, X>)
-}
 
 macro_rules! nonblocking {
     ($e:expr) => ({
@@ -43,73 +35,6 @@ macro_rules! nonblocking {
         }
     });
 }
-
-impl<'a, T: Transport + 'a, X: Http1Transaction + 'a> Transaction<'a, T, X> {
-
-    fn h1(txn: h1::txn::TxnIo<'a, T, X>) -> Transaction<'a, T, X> {
-        Transaction {
-            inner: TransactionImpl::H1(txn),
-        }
-    }
-
-    pub fn incoming(&mut self) -> ::Result<MessageHead<X::Incoming>> {
-        match self.inner {
-            TransactionImpl::H1(ref mut txn) => txn.incoming(),
-        }
-    }
-
-    #[inline]
-    pub fn outgoing(&mut self) -> &mut MessageHead<X::Outgoing> {
-        match self.inner {
-            TransactionImpl::H1(ref mut txn) => txn.outgoing(),
-        }
-    }
-
-    #[inline]
-    pub fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        match self.inner {
-            TransactionImpl::H1(ref mut txn) => txn.write(data),
-        }
-    }
-
-    #[inline]
-    pub fn try_write(&mut self, data: &[u8]) -> io::Result<Option<usize>> {
-        nonblocking!(self.write(data))
-    }
-
-    #[inline]
-    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.inner {
-            TransactionImpl::H1(ref mut txn) => txn.read(buf),
-        }
-    }
-
-    #[inline]
-    pub fn try_read(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        nonblocking!(self.read(buf))
-    }
-
-    #[inline]
-    pub fn end(&mut self) {
-        match self.inner {
-            TransactionImpl::H1(ref mut txn) => txn.end(),
-        }
-    }
-
-    #[inline]
-    pub fn abort(&mut self) {
-        match self.inner {
-            TransactionImpl::H1(ref mut txn) => txn.abort(),
-        }
-    }
-}
-
-/*
-/// Because privacy rules. Reasons.
-/// https://github.com/rust-lang/rust/issues/30905
-mod internal {
-    use std::io::{self, Write};
-    */
 
 #[derive(Debug, Clone)]
 pub struct WriteBuf<T: AsRef<[u8]>> {
@@ -288,6 +213,16 @@ impl Deserialize for RawStatus {
     fn deserialize<D>(deserializer: &mut D) -> Result<RawStatus, D::Error> where D: Deserializer {
         let representation: (u16, String) = try!(Deserialize::deserialize(deserializer));
         Ok(RawStatus(representation.0, Cow::Owned(representation.1)))
+    }
+}
+
+impl From<MessageHead<::StatusCode>> for MessageHead<RawStatus> {
+    fn from(head: MessageHead<::StatusCode>) -> MessageHead<RawStatus> {
+        MessageHead {
+            subject: head.subject.into(),
+            version: head.version,
+            headers: head.headers,
+        }
     }
 }
 

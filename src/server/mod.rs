@@ -12,13 +12,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use futures::{Future, Poll};
-use futures::stream::{Stream, MergedItem};
-use tokio::{Loop, Sender};
+use bytes::buf::BlockBuf;
+
+use futures::{Future, Async, Map};
+use futures::stream::{Stream, Receiver};
+
+use tokio::reactor::Core;
+use tokio_proto::server::listen as tokio_listen;
+use tokio_proto::pipeline;
+use tokio_proto::{Framed, Message};
+pub use tokio_service::{NewService, Service};
 
 pub use self::request::Request;
 pub use self::response::Response;
-pub use self::txn::Transaction;
+
+use self::request::Parser;
+use self::response::Serializer;
 
 use http;
 
@@ -32,18 +41,21 @@ use net::{SslServer, Transport};
 
 mod request;
 mod response;
-mod txn;
+//mod txn;
 
 /// A Server that can accept incoming network requests.
 #[derive(Debug)]
 pub struct Server<A> {
-    listeners: Vec<A>,
+    //listeners: Vec<A>,
+    _marker: PhantomData<A>,
+    addr: SocketAddr,
     keep_alive: bool,
     idle_timeout: Option<Duration>,
     max_sockets: usize,
 }
 
 impl<A: Accept> Server<A> {
+    /*
     /// Creates a new Server from one or more Listeners.
     ///
     /// Panics if listeners is an empty iterator.
@@ -57,6 +69,7 @@ impl<A: Accept> Server<A> {
             max_sockets: 4096,
         }
     }
+    */
 
     /// Enables or disables HTTP keep-alive.
     ///
@@ -86,9 +99,13 @@ impl<A: Accept> Server<A> {
 impl Server<HttpListener> { //<H: HandlerFactory<<HttpListener as Accept>::Output>> Server<HttpListener, H> {
     /// Creates a new HTTP server config listening on the provided address.
     pub fn http(addr: &SocketAddr) -> ::Result<Server<HttpListener>> {
-        HttpListener::bind(addr)
-            .map(Server::new)
-            .map_err(From::from)
+        Ok(Server {
+            _marker: PhantomData,
+            addr: addr.clone(),
+            keep_alive: true,
+            idle_timeout: Some(Duration::from_secs(10)),
+            max_sockets: 4096,
+        })
     }
 }
 
@@ -110,70 +127,29 @@ impl<S: SslServer> Server<HttpsListener<S>> {
 impl/*<A: Accept>*/ Server<HttpListener> {
     /// Binds to a socket and starts handling connections.
     pub fn handle<H>(mut self, factory: H) -> ::Result<(Listening, ServerLoop<H>)>
-    where H: HandlerFactory<HttpStream/*A::Output*/> + Send + 'static {
-        use std::rc::Rc;
-        use std::cell::RefCell;
-        use tokio::{TcpListener};
-        trace!("handle server = {:?}", self);
+    where H: NewService<Request=Request, Response=Response, Error=::Error> + Send + 'static {
+        let mut core = try!(Core::new());
+        let handle = core.handle();
+        let _ = try!(tokio_listen(&handle, self.addr, move |sock| {
+            let service = HttpService { inner: try!(factory.new_service()) };
+            let framed = Framed::new(
+                sock,
+                Parser,
+                Serializer,
+                BlockBuf::default(),
+                BlockBuf::default()
+            );
+            pipeline::Server::new(service, framed)
+        }));
+        core.run(::futures::empty::<(), ()>()).unwrap();
 
-        let mut reactor = try!(Loop::new());
-
-        let listener = self.listeners.remove(0).0;
-        let addr = try!(listener.local_addr());
-        let handle = reactor.handle();
-
-        debug!("adding Listener({})", addr);
-
-        let listener = TcpListener::from_listener(listener, &addr, handle);
-        let keep_alive = self.keep_alive;
-        let idle_timeout = self.idle_timeout;
-
-
-        let pin = reactor.pin();
-        let (shutdown_tx, shutdown_rx) = pin.handle().clone().channel();
-        let work = shutdown_rx.join(listener).and_then(move |(shutdown_rx, listener)| {
-
-            let factory = Rc::new(RefCell::new(Context {
-                factory: factory,
-                idle_timeout: idle_timeout,
-                keep_alive: keep_alive
-            }));
-            listener.incoming().merge(shutdown_rx).for_each(move |merged| {
-                match merged {
-                    MergedItem::First((sock, addr)) => {
-                        let socket = HttpStream(sock);
-                        let conn = http::Conn::new(addr, socket, ConstFactory(factory.clone()));
-                        pin.add_loop_data(Conn {
-                            inner: conn,
-                        }).forget();
-                        Ok(())
-                    },
-                    _ => {
-                        // Second or Both means shutdown was received
-                        debug!("ServerLoop shutdown received");
-                        Err(io::Error::new(io::ErrorKind::Other, "shutdown"))
-                    }
-                }
-            })
-        }).map_err(|_| ());
-
-        Ok((
-            Listening {
-                addrs: vec![addr],
-                shutdown: shutdown_tx,
-            },
-            ServerLoop {
-                inner: Some((reactor, Box::new(work))),
-                _marker: PhantomData,
-            }
-        ))
-        //reactor.run(work);
+        unimplemented!()
     }
 }
 
 /// A configured `Server` ready to run.
 pub struct ServerLoop<H> {
-    inner: Option<(Loop, Box<Future<Item=(), Error=()>>)>,
+    inner: Option<(Core, Box<Future<Item=(), Error=()>>)>,
     _marker: PhantomData<H>
 }
 
@@ -182,13 +158,6 @@ impl<H> fmt::Debug for ServerLoop<H> {
         f.pad("ServerLoop")
     }
 }
-
-// If the Handler is Send, we can assume the whole thing is Send.
-//
-// It's not by default, because the ServerLoop holds on to an Rc,
-// which makes it not Send. However, this is safe since we never gave
-// any copies away, and we move the Loop and the Future together.
-unsafe impl<H: Send> Send for ServerLoop<H> {}
 
 impl<H> ServerLoop<H> {
     /// Runs the server forever in this loop.
@@ -207,58 +176,10 @@ impl<H> Drop for ServerLoop<H> {
     }
 }
 
-struct Context<F> {
-    factory: F,
-    idle_timeout: Option<Duration>,
-    keep_alive: bool,
-}
-
-struct ConstFactory<F>(Rc<RefCell<Context<F>>>);
-
-impl<F: HandlerFactory<T>, T: Transport> http::ConnectionHandler<T> for ConstFactory<F> {
-    type Txn = txn::Handle<ConstFactory<F>, T>;
-
-    fn transaction(&mut self) -> Option<Self::Txn> {
-        Some(txn::Handle::new(ConstFactory(self.0.clone())))
-    }
-
-    /*
-    fn keep_alive_interest(&self) -> Next {
-        if let Some(dur) = self.0.borrow().idle_timeout {
-            Next::read().timeout(dur)
-        } else {
-            Next::read()
-        }
-    }
-    */
-}
-
-impl<F: HandlerFactory<T>, T: Transport> HandlerFactory<T> for ConstFactory<F> {
-    type Output = F::Output;
-
-    fn create(&mut self, incoming: ::Result<Request>) -> ::Result<F::Output> {
-        self.0.borrow_mut().factory.create(incoming)
-    }
-}
-
-struct Conn<T, F> where T: Transport, F: HandlerFactory<T> {
-    inner: http::Conn<SocketAddr, T, ConstFactory<F>>
-}
-
-impl<T, F> Future for Conn<T, F>
-where T: Transport,
-      F: HandlerFactory<T> {
-    type Item = ();
-    type Error = ::error::Void;
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.inner.poll()
-    }
-}
-
 /// A handle of the running server.
 pub struct Listening {
     addrs: Vec<SocketAddr>,
-    shutdown: Sender<()>,
+    //shutdown: Sender<()>,
 }
 
 impl fmt::Debug for Listening {
@@ -290,41 +211,27 @@ impl Listening {
     /// Stop the server from listening to its socket address.
     pub fn close(self) {
         debug!("closing server {}", self);
-        let _ = self.shutdown.send(());
+        //let _ = self.shutdown.send(());
     }
 }
 
-struct Closing {
-    _inner: (),
+struct HttpService<T> {
+        inner: T,
 }
 
-impl Future for Closing {
-    type Item = ();
-    type Error = ();
+impl<T> Service for HttpService<T>
+    where T: Service<Request=Request, Response=Response, Error=::Error>,
+{
+    type Request = Request;
+    type Response = Message<Response, Receiver<(), ::Error>>;
+    type Error = ::Error;
+    type Future = Map<T::Future, fn(Response) -> Message<Response, Receiver<(), ::Error>>>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        unimplemented!("Closing::poll()")
+    fn call(&self, req: Request) -> Self::Future {
+        self.inner.call(req).map(Message::WithoutBody)
     }
-}
 
-/// dox
-pub trait Handler<T: Transport> {
-    /// dox
-    fn ready(&mut self, txn: &mut Transaction<T>);
-}
-
-/// Used to create a `Handler` when a new transaction is received by the server.
-pub trait HandlerFactory<T: Transport> {
-    /// The `Handler` to use for the incoming transaction.
-    type Output: Handler<T>;
-    /// Creates the associated `Handler`.
-    fn create(&mut self, incoming: ::Result<Request>) -> ::Result<Self::Output>;
-}
-
-impl<F, H, T> HandlerFactory<T> for F
-where F: FnMut(::Result<Request>) -> ::Result<H>, H: Handler<T>, T: Transport {
-    type Output = H;
-    fn create(&mut self, incoming: ::Result<Request>) -> ::Result<H> {
-        self(incoming)
+    fn poll_ready(&self) -> Async<()> {
+        self.inner.poll_ready()
     }
 }

@@ -2,6 +2,12 @@
 //!
 //! These are responses sent by a `hyper::Server` to clients, after
 //! receiving a request.
+
+use bytes::buf::{BlockBuf};
+use bytes::MutBuf;
+use tokio_proto::pipeline::Frame;
+use tokio_proto::Serialize;
+
 use header;
 use http;
 use status::StatusCode;
@@ -11,12 +17,30 @@ use version;
 /// The outgoing half for a Tcp connection, created by a `Server` and given to a `Handler`.
 ///
 /// The default `StatusCode` for a `Response` is `200 OK`.
-#[derive(Debug)]
-pub struct Response<'a> {
-    head: &'a mut http::MessageHead<StatusCode>,
+#[derive(Debug, Default)]
+pub struct Response {
+    head: http::MessageHead<StatusCode>,
+    body: Option<&'static [u8]>,
 }
 
-impl<'a> Response<'a> {
+impl Response {
+    /// Create a new Response.
+    #[inline]
+    pub fn new() -> Response {
+        Response::default()
+    }
+
+    pub fn header<H: ::header::Header>(mut self, header: H) -> Self {
+        self.head.headers.set(header);
+        self
+    }
+
+    pub fn body(mut self, buf: &'static [u8]) -> Self {
+        self.body = Some(buf);
+        self
+    }
+
+    /*
     /// The headers of this response.
     #[inline]
     pub fn headers(&self) -> &header::Headers { &self.head.headers }
@@ -40,11 +64,26 @@ impl<'a> Response<'a> {
     pub fn set_status(&mut self, status: StatusCode) {
         self.head.subject = status;
     }
+    */
 }
 
-/// Creates a new Response that can be used to write to a network stream.
-pub fn new(head: &mut http::MessageHead<StatusCode>) -> Response {
-    Response {
-        head: head
+pub struct Serializer;
+
+impl Serialize for Serializer {
+    type In = Frame<Response, (), ::Error>;
+
+    fn serialize(&mut self, frame: Self::In, buf: &mut BlockBuf) {
+        let frame = match frame {
+            Frame::Message(mut res) => {
+                if res.body.is_none() {
+                    res.head.headers.set(::header::ContentLength(0));
+                }
+                ::http::h1::serialize::Response.serialize(Frame::Message(res.head.into()), buf);
+                if let Some(body) = res.body {
+                    buf.copy_from(body);
+                }
+            },
+            _ => unimplemented!("Frame::*")
+        };
     }
 }
