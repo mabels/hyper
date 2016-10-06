@@ -4,6 +4,8 @@ extern crate futures;
 extern crate pretty_env_logger;
 extern crate num_cpus;
 
+use futures::Async;
+
 use hyper::{HttpStream};
 use hyper::header::{ContentLength, ContentType};
 use hyper::server::{Server, Service, Request, Response/*, HttpListener*/};
